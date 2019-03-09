@@ -1,0 +1,25 @@
+# Discord Settings
+BotToken: "YOUR_BOT_TOKEN"
+Channel: "Channel_ID"
+Exclude: {
+  "ANY!":               true,
+  "CERTIFICATE":        true,
+  "AUXDATA":            true,
+  "BACKUP":             true,
+  "BDJO":               true,
+  "CLIPINF":            true,
+  "JAR":                true,
+  "META":               true,
+  "PLAYLIST":           true,
+  "MovieObject.bdmv":   true,
+  "index.bdmv":         true,
+  "disc.inf":           true,
+  "Thumbs.db":          true,
+  "Rips":               true,
+}
+
+# FTP Settings
+IP: "X.X.X.X"
+Port: "42"
+User: "XYZ"
+PW: "12345"
