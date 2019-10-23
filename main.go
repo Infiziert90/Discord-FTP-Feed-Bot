@@ -2,28 +2,87 @@ package main
 
 import (
 	"fmt"
+	"github.com/Infiziert90/goftp"
 	"github.com/bwmarrin/discordgo"
 	"github.com/dustin/go-humanize"
-	"github.com/jlaffaye/ftp"
 	"gopkg.in/yaml.v2"
+	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
 
-type File struct {
-	Name string
-	Size uint64
-	Path string
+type FTPConn struct {
+	mux        sync.Mutex
+	connection *goftp.Client
 }
 
-type Folder struct {
-	Name    string
-	Path    string
-	Entries []*File
+func (c *FTPConn) List(path string) []os.FileInfo {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	for i := 0; i < 5; i++ {
+		entries, err := c.connection.ReadDir(path)
+		if err == nil {
+			return entries
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	c.Reconnect()
+	entries, err := c.connection.ReadDir(path)
+	if err == nil {
+		return entries
+	}
+
+	return nil
+}
+
+func (c *FTPConn) FileSize(path string) os.FileInfo {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	for i := 0; i < 5; i++ {
+		size, err := c.connection.Stat(path)
+		if err == nil {
+			return size
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	c.Reconnect()
+	size, err := c.connection.Stat(path)
+	if err == nil {
+		return size
+	}
+
+	return nil
+}
+
+func (c *FTPConn) Reconnect() {
+	err := c.connection.Close()
+	if err != nil {
+		fmt.Printf("Error while closing the connection: %s\n", err)
+	}
+
+	fmt.Println("Creating new FTP client.")
+	c.connection = createNewFTPClient(os.Stdout)
+}
+
+func (c *FTPConn) Quit() {
+	err := c.connection.Close()
+	if err != nil {
+		fmt.Printf("Error while closing the connection: %s\n", err)
+	}
+}
+
+type File struct {
+	Name string
+	Size int64
+	Path string
 }
 
 type Config struct {
@@ -36,11 +95,14 @@ type Config struct {
 	PW       string          `yaml:"PW"`
 }
 
+const FTPCONNLIMIT = 6
+
 var (
 	config      Config
 	firstTime   = true
 	session     *discordgo.Session
-	alreadySeen = make(map[string]bool)
+	alreadySeen sync.Map
+	random      *rand.Rand
 )
 
 func init() {
@@ -49,6 +111,9 @@ func init() {
 	if config.BotToken == "YOUR_BOT_TOKEN" {
 		panic("Default BotToken, pls change the settings in config.yaml.")
 	}
+
+	s1 := rand.NewSource(time.Now().UnixNano())
+	random = rand.New(s1)
 }
 
 func createConfig(conf *Config) {
@@ -87,9 +152,9 @@ func main() {
 func OnReady(s *discordgo.Session, _ *discordgo.Ready) {
 	if firstTime {
 		session = s
-		fmt.Printf("Start filling list with all entries.\n")
-		scanFTP(false)
-		fmt.Printf("Finished.\n")
+		fmt.Printf("Start filling already seen list with current entries.\n")
+		scanFTP(true)
+		fmt.Printf("Finished Filling.\n")
 		go RunForEver()
 		fmt.Printf("Run forever.\n")
 		firstTime = false
@@ -98,20 +163,103 @@ func OnReady(s *discordgo.Session, _ *discordgo.Ready) {
 
 func RunForEver() {
 	for {
+		fmt.Println("Sleeping")
 		time.Sleep(10 * time.Minute)
 		fmt.Printf("Scan FTP\n")
 		start := time.Now()
-		embed := scanFTP(true)
+		embed := scanFTP(false)
 		sendMessage(embed)
 		elapsed := time.Since(start)
 		fmt.Printf("Finished scan   Time: %s\n", elapsed)
 	}
 }
 
+func createNewFTPClient(writer io.Writer) *goftp.Client {
+	ftpConfig := goftp.Config{
+		User:               config.User,
+		Password:           config.PW,
+		ConnectionsPerHost: 1,
+		Timeout:            3 * time.Second,
+		Logger:             writer,
+	}
+
+	client, err := goftp.DialConfig(ftpConfig, config.IP+":"+config.Port)
+	if err != nil {
+		panic(err)
+	}
+
+	return client
+}
+
+func createFTPPool() [FTPCONNLIMIT]FTPConn {
+	var pool [FTPCONNLIMIT]FTPConn
+	for i := 0; i < FTPCONNLIMIT; i++ {
+		pool[i] = FTPConn{connection: createNewFTPClient(ioutil.Discard)}
+	}
+
+	return pool
+}
+
+func getRandomConnectionIndex() int {
+	return random.Intn(FTPCONNLIMIT)
+}
+
+func scanFTP(init bool) *discordgo.MessageEmbed {
+	var tmpCache sync.Map
+	var entries sync.Map
+
+	pool := createFTPPool()
+
+	embed := discordgo.MessageEmbed{Title: "FTP", Description: "  "}
+
+	ftpEntries := pool[0].List("/")
+	if ftpEntries == nil {
+		return &embed
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	findNewFiles(pool, &tmpCache, ftpEntries, "/", &wg)
+	wg.Wait()
+
+	if init {
+		return nil
+	}
+
+	time.Sleep(1 * time.Second)
+
+	wg.Add(1)
+	checkFiles(pool, &tmpCache, &entries, &wg)
+	wg.Wait()
+
+	e := make(map[string][]*File, 0)
+	entries.Range(func(key interface{}, value interface{}) bool {
+		v := value.(*File)
+		e[v.Path] = append(e[v.Path], v)
+
+		return true
+	})
+
+	for _, v := range e {
+		if len(v) == 1 {
+			value := fmt.Sprintf("Path: %s   Size: %s", v[0].Path, humanize.Bytes(uint64(v[0].Size)))
+			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: v[0].Name, Value: value})
+		} else {
+			value := fmt.Sprintf("%d new episodes", len(v))
+			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: v[0].Path, Value: value})
+		}
+	}
+
+	fmt.Println("Start observeUpload")
+	go observeUpload(pool, &tmpCache)
+
+	return &embed
+}
+
 func sendMessage(embed *discordgo.MessageEmbed) {
 	if len(embed.Fields) == 0 {
 	} else if len(embed.Fields) > 25 {
-		embed.Fields = embed.Fields[:10]
+		embed.Fields = embed.Fields[:20]
 		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: "Truncated", Value: "Truncated"})
 		session.ChannelMessageSendEmbed(config.Channel, embed)
 	} else {
@@ -119,110 +267,129 @@ func sendMessage(embed *discordgo.MessageEmbed) {
 	}
 }
 
-func observeUpload(client *ftp.ServerConn, uploadCache map[string]*File) {
-	defer client.Logout()
-	for len(uploadCache) > 0 {
-		time.Sleep(20 * time.Second)
+func getSyncMapLength(myMap *sync.Map) int {
+	length := 0
+
+	myMap.Range(func(_, _ interface{}) bool {
+		length++
+
+		return true
+	})
+
+	return length
+}
+
+func dieWhenStuck(checker *int, key string) {
+	time.Sleep(180 * time.Second)
+	if *checker != 1 {
+		panic("Stuck with path: " + key)
+	}
+}
+
+func findNewFiles(pool [FTPCONNLIMIT]FTPConn, tmpCache *sync.Map, ftpEntries []os.FileInfo, path string, oldWG *sync.WaitGroup) {
+	var newWG sync.WaitGroup
+	for i := 0; i < len(ftpEntries); i++ {
+		name := ftpEntries[i].Name()
+		fullPath := path + name
+
+		if _, ok := alreadySeen.Load(fullPath); !(config.Exclude[name] || ok) {
+			if ftpEntries[i].IsDir() {
+
+				checker := 0
+				go dieWhenStuck(&checker, fullPath)
+				index := getRandomConnectionIndex()
+				newFolder := pool[index].List(fullPath + "/")
+				checker = 1
+
+				if newFolder != nil {
+					newWG.Add(1)
+					go findNewFiles(pool, tmpCache, newFolder, fullPath+"/", &newWG)
+				}
+			} else {
+				if !firstTime {
+					fmt.Printf("Found new Files: %s\n", fullPath)
+				}
+				tmpCache.Store(fullPath, &File{name, ftpEntries[i].Size(), path})
+				alreadySeen.Store(fullPath, true)
+			}
+		}
+	}
+
+	newWG.Wait()
+	oldWG.Done()
+}
+
+func checkFiles(pool [FTPCONNLIMIT]FTPConn, tmpCache *sync.Map, entries *sync.Map, oldWG *sync.WaitGroup) {
+	var newWG sync.WaitGroup
+	tmpCache.Range(func(key interface{}, value interface{}) bool {
+		newWG.Add(1)
+		go func() {
+			v := value.(*File)
+
+			index := getRandomConnectionIndex()
+			newSize := pool[index].FileSize(v.Path + v.Name)
+
+			if newSize == nil || v.Size != newSize.Size() {
+				newWG.Done()
+				return
+			}
+
+			fmt.Printf("Found new file: %s\n", v.Name)
+			entries.Store(v.Path+v.Name, v)
+			tmpCache.Delete(key)
+
+			newWG.Done()
+		}()
+
+		return true
+	})
+
+	newWG.Wait()
+	oldWG.Done()
+}
+
+func observeUpload(pool [FTPCONNLIMIT]FTPConn, uploadCache *sync.Map) {
+	for length := getSyncMapLength(uploadCache); length > 0; length = getSyncMapLength(uploadCache) {
+		time.Sleep(40 * time.Second)
 
 		embed := discordgo.MessageEmbed{Title: "FTP"}
-		Finished := make(map[string]*File)
-		for k, v := range uploadCache {
-			newSize, err := client.FileSize(v.Path + v.Name)
-			if err != nil {
-				fmt.Println(err)
+		Finished := make(map[string]File)
+
+		uploadCache.Range(func(key interface{}, value interface{}) bool {
+			k := key.(string)
+			v := value.(*File)
+
+			index := getRandomConnectionIndex()
+			newSize := pool[index].FileSize(v.Path + v.Name)
+			if newSize == nil {
 				fmt.Printf("Deleted %s\n", v.Name)
-				delete(uploadCache, v.Path+v.Name)
-				continue
+				uploadCache.Delete(key)
+				alreadySeen.Delete(k)
+				return true
 			}
 
-			if v.Size != uint64(newSize) {
-				v.Size = uint64(newSize)
-				continue
+			if v.Size != newSize.Size() {
+				fmt.Printf("Old size: %d \t New size: %d\n", v.Size, newSize.Size())
+				v.Size = newSize.Size()
+				return true
 			}
 
-			Finished[v.Name] = v
-			delete(uploadCache, v.Path+v.Name)
-			fmt.Printf("Finished upload: %s\n", k)
-		}
+			Finished[v.Name] = *v
+			uploadCache.Delete(key)
+			fmt.Printf("Finished upload: %s\n", v.Name)
+
+			return true
+		})
 
 		for _, v := range Finished {
-			value := fmt.Sprintf("Path: %s   Size: %s\n", v.Path, humanize.Bytes(v.Size))
+			value := fmt.Sprintf("Path: %s   Size: %s\n", v.Path, humanize.Bytes(uint64(v.Size)))
 			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: v.Name, Value: value})
 		}
+
 		sendMessage(&embed)
 	}
-}
 
-func findNewFiles(client *ftp.ServerConn, entries map[string]*Folder, ftpEntries []*ftp.Entry, path string, uploadCache map[string]*File) {
-	for i := range ftpEntries {
-		if alreadySeen[path+ftpEntries[i].Name] || config.Exclude[ftpEntries[i].Name] {
-			continue
-		}
-
-		if ftpEntries[i].Type == 1 {
-			fullPath := path + ftpEntries[i].Name + "/"
-			entries[fullPath] = &Folder{ftpEntries[i].Name, fullPath, make([]*File, 0)}
-			newFolder, err := client.List(fullPath)
-			if err == nil {
-				findNewFiles(client, entries, newFolder, fullPath, uploadCache)
-			}
-		} else {
-			uploadCache[path+ftpEntries[i].Name] = &File{ftpEntries[i].Name, ftpEntries[i].Size, path}
-			alreadySeen[path+ftpEntries[i].Name] = true
-		}
+	for index := range pool {
+		pool[index].Quit()
 	}
-}
-
-func checkFiles(client *ftp.ServerConn, entries map[string]*Folder, uploadCache map[string]*File, normalRun bool) {
-	for _, v := range uploadCache {
-		if normalRun {
-			newSize, _ := client.FileSize(v.Path + v.Name)
-			if v.Size != uint64(newSize) {
-				continue
-			}
-			fmt.Printf("Found new file: %s\n", v.Name)
-		}
-		entries[v.Path].Entries = append(entries[v.Path].Entries, v)
-		delete(uploadCache, v.Path+v.Name)
-	}
-}
-
-func scanFTP(normalRun bool) (*discordgo.MessageEmbed) {
-	uploadCache := make(map[string]*File)
-	embed := discordgo.MessageEmbed{Title: "FTP", Description: "  "}
-	entries := map[string]*Folder{"/": {"/", "/", make([]*File, 0)}}
-	client, err := ftp.Dial(config.IP + ":" + config.Port)
-	if err != nil {
-		fmt.Println(err)
-		return &embed
-	}
-
-	if err := client.Login(config.User, config.PW); err != nil {
-		fmt.Println(err)
-		return &embed
-	}
-
-	ftpEntries, err := client.List("/")
-	if err != nil {
-		fmt.Println(err)
-		return &embed
-	}
-
-	findNewFiles(client, entries, ftpEntries, "/", uploadCache)
-	time.Sleep(1 * time.Second)
-	checkFiles(client, entries, uploadCache, normalRun)
-
-	for _, v := range entries {
-		if len(v.Entries) == 0 {
-		} else if len(v.Entries) == 1 {
-			value := fmt.Sprintf("Path: %s   Size: %s", v.Path, humanize.Bytes(v.Entries[0].Size))
-			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: v.Entries[0].Name, Value: value})
-		} else {
-			value := fmt.Sprintf("%d new episodes", len(v.Entries))
-			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{Name: v.Path, Value: value})
-		}
-	}
-
-	go observeUpload(client, uploadCache)
-	return &embed
 }
