@@ -1,14 +1,26 @@
 # Discord Settings
 BotToken: "YOUR_BOT_TOKEN"
-Channel: "Channel_ID"
-Exclude: {
-  "FolderX":            true,
-  "FolderY":            true,
-  "FolderZ":            true
-}
 
 # FTP Settings
-IP: "X.X.X.X"
+IP: "127.0.0.1"
 Port: "42"
 User: "XYZ"
 PW: "12345"
+
+# The listed files and folders will be ignored
+Exclude: {
+  "FolderX":            true,
+  "FolderY":            true,
+  "FolderZ":            true,
+  "FileA":              true,
+}
+
+# Getting matched by the regex will prevent another regex match for the files
+# Regex "" is always last and will post any leftover files
+Feeds:
+  Feed1:
+    ChannelID: "987654321"
+    Regex: ""
+  Feed2:
+    ChannelID: "123456789"
+    Regex: "\\d{4}-.*"

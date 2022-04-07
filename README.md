@@ -1,5 +1,8 @@
 # Discord FTP Feed Bot
-Just a little feed bot for discord
+Posts a discord message for every new file uploaded into the FTP 
++ YAML config file for easy use
++ Regex support for multiple feed channel
++ Fast scans thanks for multithreading
 
 ## Requirements
 
@@ -11,5 +14,5 @@ To run this bot, you will need:
 
 ## Help?
 
-Add me on discord and message me with your problem:
+Add me on discord  
 Infi#6958
