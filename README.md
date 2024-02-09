@@ -2,7 +2,7 @@
 Posts a discord message for every new file uploaded into the FTP 
 + YAML config file for easy use
 + Regex support for multiple feed channel
-+ Fast scans thanks for multithreading
++ Fast scans thanks to multithreading
 
 ## Requirements
 
